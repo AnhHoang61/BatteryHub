@@ -25,5 +25,8 @@ struct DeviceStatus {
 // Queries every supported device. Blocking (can take a second or two); call from a worker thread.
 std::vector<DeviceStatus> PollAllDevices();
 
+// Returns true when two driver entries represent the same physical peripheral (e.g. receiver + wired USB).
+bool SamePhysicalDevice(const DeviceStatus& a, const DeviceStatus& b);
+
 // Prints every HID collection (for adding support for new devices).
 std::wstring DumpHidCollections();

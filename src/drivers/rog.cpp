@@ -145,8 +145,22 @@ bool ReadModel(HidDev& d, const Model& m, DeviceStatus& s) {
 }
 
 void AddOnce(PollContext& ctx, std::vector<std::wstring>& seen, const DeviceStatus& s) {
-    for (auto& n : seen)
-        if (n == s.name) return;
+    // 为什么这么做：插线充电时有线端口与 2.4G / Omni 接收器可能各自上报一次；若先看到休眠或未充电记录，遇到有线实时充电读数时原地升级覆盖
+    for (auto& o : ctx.out) {
+        if (o.name == s.name && o.kind == s.kind) {
+            const bool oLive = o.connected && !o.asleep && o.percent >= 0;
+            const bool sLive = s.connected && !s.asleep && s.percent >= 0;
+            if ((!oLive && sLive) || (!o.charging && s.charging && sLive)) {
+                o.connected = s.connected;
+                o.asleep = s.asleep;
+                o.percent = s.percent;
+                o.via = s.via;
+                o.levelText = s.levelText;
+            }
+            o.charging |= s.charging;
+            return;
+        }
+    }
     seen.push_back(s.name);
     ctx.out.push_back(s);
 }

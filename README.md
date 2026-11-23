@@ -1,4 +1,45 @@
-# BatteryHub
+# BatteryHub Lite & Smooth（定制增强版）
+
+> **开源声明 / Notice of Modification (GNU GPL v3.0)**：本项目为 [krisgfx9/Wireless-Device-Battery-Monitor](https://github.com/krisgfx9/Wireless-Device-Battery-Monitor) 的开源分支修改版本，依据 **GNU General Public License v3.0**（详见 [LICENSE](LICENSE)）发布，保留原仓库全部版权与开源许可协议。
+>
+> **Modified Fork**：This modified version by Pilgrim415 customizes tray icon rendering, expands brand colors (51 brands / 26 phone brands), adds Simplified Chinese Phone Link support & gamepad fixes, prevents wired-charging duplicate icons, and provides a lightweight offline Windows build (`build-lite.bat`). Original upstream documentation follows below.
+
+![Tray icons preview](docs/preview_all_icons.png)
+
+## 本分支主要改动
+
+- **4× 超采样（SSAA）平滑字体 & 双托盘模式**（`src/main.cpp`）：
+  - 优先采用 `Segoe UI Variable Text` + `Segoe Fluent Icons` 进行 4 倍超采样渲染与伽马补偿（`0.82`），彻底消除小像素系统托盘毛刺。
+  - 解锁右键菜单 **`托盘上下排布（图标在数字上方）`** 实时切换：
+    - **方案 3（默认）**：底层满幅品牌色设备大水印 + 3×3 加权柔滑镂空隔离带 + 顶层 4× SSAA 大号数字 + 底部电量条；
+    - **方案 B1**：上方品牌色设备图标 + 下方平滑百分比数字；
+  - 休眠设备保持品牌色调并适度降透明（`185/255`），依然可辨识设备与品牌。
+- **全外设充电状态视觉提示**（`src/main.cpp`）：
+  - 手机、鼠标、键盘、手柄、耳机、麦克风等设备充电时，数字、底部电量条与 **4×4 解析亚像素光栅化实心闪电角标** 统一亮起高对比**充电绿**（深色 `#38E870` / 浅色 `#0C983A`），同时**设备水印本体保留各自品牌色**以便同框区分多设备。
+- **51 个品牌配色库（覆盖 26 个手机品牌 + 国产/客制化外设与手柄）**（`src/brands.h`、`src/brands.cpp`）：
+  - 新增 `vivo`、`iQOO`、`小米`、`华为`、`荣耀`、`OPPO`、`一加`、`realme`、`魅族`、`Google`、`Sony`（含 `WH-`/`WF-`/`LinkBuds` 专属铂金暖金）、`Motorola`、`Nothing`、`Nubia/红魔/中兴`、`ASUS(Zenfone)`、`Lenovo`、`Nokia`、`HTC`、`LG`、`TECNO`、`Sharp`、`Fairphone`、`BlackBerry`、`Smartisan` 以及 `雷柏`、`迈从`、`VGN/VXE/ATK`、`Keychron`、`狼蛛`、`黑爵`、`漫步者`、`八位堂`、`飞智`、`盖世小鸡`、`北通`；
+  - 支持 Phone Link 常见入网型号前缀识别（如 `SM-`、`V2xxx`、`24031PN0DC`、`RMX`、`CPH`、`NX`、`XT`、`XQ-` 等）。
+- **Phone Link 简体中文 1% 精度 & 蓝牙友好名融合**（`src/drivers/phonelink_protocol.h`、`src/drivers/generic.cpp`）：
+  - 解析简体中文版 Windows“手机连接”的 `StartMenuCompanion.json`（如 `电池电量剩余 XX%，正在充电`）；
+  - 当 Phone Link 与蓝牙同时存在时，自动用蓝牙友好名称替换入网代号并将设备键统一归并到 `bt:{...}`，串联同一条电量历史曲线，避免出现两个手机图标。
+- **蓝牙 / WGI 手柄增强 & 插线充电去重**（`src/drivers/generic.cpp`、`src/hid.cpp`、`src/drivers/xinput.cpp`、`src/drivers/razer.cpp`、`src/drivers/rog.cpp`、`src/devices.cpp`、`src/main.cpp`）：
+  - 修复 Windows 11 细分 PnP 类别 `Input.Gaming.*` 漏判，放开 `PollWgi()` 厂商白名单限制并补充中英文手柄关键词；
+  - 修复无线外设插 USB 线充电切换设备键时因 120 秒 `inGrace` 导致短暂分裂两个图标的问题，并新增跨驱动归一化同设备合并 `DeduplicateByDevice()`；
+  - 补齐 `lang/zh-CN.txt` 与 `lang/zh-TW.txt` 中遗漏的 `Dim sleeping devices` 词条翻译。
+- **离线极致轻量化单文件编译**（`build-lite.bat`、`src/main.cpp`、`src/devices.cpp`）：
+  - 精简菜单移除在线反馈/赞助/自动更新入口及 `WINHTTP.dll` / `bcrypt.dll` 依赖；纯托盘模式空闲零 `TIMER_WIDGET` 唤醒；开启 `-Os -fno-exceptions -fno-rtti` + 效率模式（`EcoQoS`）+ 工作集修剪，体积约 **980 KB**（`< 1 MB`）；默认不擅自写入开机自启，仅对已勾选自启且移动 EXE 路径的场景自动同步。
+
+### 从源码编译轻量版
+
+在安装 MinGW-w64 (GCC / UCRT64) 的 Windows 环境下运行：
+
+```bat
+build-lite.bat 1.1.0 release
+```
+
+---
+
+# BatteryHub (Upstream Documentation)
 
 *Formerly **Wireless Battery**. Version 1.1.0 renamed the app; an update keeps your settings, startup choice and battery history.*
 

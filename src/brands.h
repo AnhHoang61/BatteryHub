@@ -8,6 +8,10 @@ enum class Accent {
     None,
     Razer, Logitech, SteelSeries, Corsair, HyperX, Rog, Zowie,
     PlayStation, Xbox, Galaxy, Apple, Jabra, Jbl, CoolerMaster, Steam, Redragon,
+    Vivo, Iqoo, Xiaomi, Huawei, Honor, Oppo, OnePlus, Realme, Meizu,
+    Rapoo, Mchose, Vgn, Keychron, Aula, Ajazz, Edifier,
+    EightBitDo, Flydigi, GameSir, Beitong,
+    Google, Sony, Motorola, Nothing, Nubia, Asus, Lenovo, Nokia, Htc, Lg, Tecno, Sharp, Fairphone, BlackBerry, Smartisan,
 };
 
 struct BrandColor { unsigned char r, g, b; };

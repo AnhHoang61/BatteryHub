@@ -124,13 +124,17 @@ std::wstring FirstStringProp(HDEVINFO di, SP_DEVINFO_DATA* dd, const DEVPROPKEY&
 // so KindFromClassOfDevice has nothing to work with and a LE keyboard or mouse ends up as "Other".
 // Windows still files the device under a category for Settings > Bluetooth & devices; use it.
 DeviceKind KindFromCategory(const std::wstring& c) {
-    if (c == L"Communication.Phone" ||
-        c.rfind(L"Communication.Phone.", 0) == 0)
-        return DeviceKind::Phone;
-    if (c == L"Input.Keyboard") return DeviceKind::Keyboard;
-    if (c == L"Input.Mouse") return DeviceKind::Mouse;
-    if (c == L"Input.Gaming") return DeviceKind::Gamepad;
-    if (c.rfind(L"Communication.Headset", 0) == 0 || c == L"Audio.Headphones") return DeviceKind::Headset;
+    // 为什么这么做：Windows 11 PnP 设备类别常带有细分后缀（如 Input.Gaming.Controller、Input.Mouse.Bluetooth），按“全等或点号前缀”匹配可避免蓝牙 Xbox 手柄等设备被漏判为 Other
+    auto matchPrefix = [&](const wchar_t* prefix) {
+        const size_t len = std::char_traits<wchar_t>::length(prefix);
+        return c.compare(0, len, prefix) == 0 && (c.size() == len || c[len] == L'.');
+    };
+    if (matchPrefix(L"Communication.Phone")) return DeviceKind::Phone;
+    if (matchPrefix(L"Input.Keyboard")) return DeviceKind::Keyboard;
+    if (matchPrefix(L"Input.Mouse")) return DeviceKind::Mouse;
+    if (matchPrefix(L"Input.Gaming")) return DeviceKind::Gamepad;
+    if (c.rfind(L"Communication.Headset", 0) == 0 || matchPrefix(L"Audio.Headphones"))
+        return DeviceKind::Headset;
     return DeviceKind::Other;
 }
 
@@ -341,6 +345,32 @@ void PollBluetooth(PollContext& ctx) {
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromBleIds(ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromCollections(ctx.colls, ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other) s.kind = GuessKind(s.name);
+        // 为什么这么做：手机在蓝牙中常显示营销型号（如 vivo X100 Ultra），而 Phone Link 中常只上报入网型号（如 V2366GA），按名称去重会失效；
+        // 当 Phone Link 已在线提供 1% 精准电量时，将其友好名称同步为蓝牙名、设备键统一归并到 bt:{...} 以串联历史曲线，并跳过经典蓝牙 20% 粗略条目
+        if (s.kind == DeviceKind::Phone) {
+            auto looksLikeModelCode = [](const std::wstring& n) {
+                if (n.empty()) return false;
+                bool hasDigit = false;
+                for (wchar_t ch : n) {
+                    if (ch == L' ' || ch == L'\t') return false;
+                    if (ch >= L'0' && ch <= L'9') hasDigit = true;
+                }
+                return hasDigit;
+            };
+            bool merged = false;
+            for (auto& d : ctx.out) {
+                if (d.key == L"phonelink" && !d.asleep) {
+                    if (looksLikeModelCode(d.name) && !s.name.empty() && s.name != L"Bluetooth device" &&
+                        !looksLikeModelCode(s.name)) {
+                        d.name = s.name;
+                    }
+                    d.key = s.key;
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) continue;
+        }
         auto addr = containerAddr.find(cid);
         if (s.kind == DeviceKind::Headset && addr != containerAddr.end()) {
             // The passive BLE watcher starts with the first Bluetooth headset and keeps running. Right

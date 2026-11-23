@@ -61,9 +61,35 @@ Rz Command(HidDev& d, BYTE tid, BYTE cls, BYTE id, BYTE size, std::vector<BYTE>&
 }
 
 std::wstring CleanName(std::wstring n) {
-    for (const wchar_t* suffix : { L" Dongle", L" (Wired)", L" (Wireless)", L" Wireless Receiver", L" Receiver", L" HyperSpeed Dongle" }) {
-        size_t l = wcslen(suffix);
-        if (n.size() > l && n.compare(n.size() - l, l, suffix) == 0) n = n.substr(0, n.size() - l);
+    // 为什么这么做：雷蛇 8K/HyperPolling 接收器与有线口常附带复合后缀，循环剥离可确保插线与无线模式下归一到同一个物理设备名
+    static const wchar_t* kSuffixes[] = {
+        L" HyperPolling Wireless Dongle",
+        L" HyperSpeed Wireless Dongle",
+        L" HyperPolling Dongle",
+        L" HyperSpeed Dongle",
+        L" Wireless Dongle",
+        L" Wireless Receiver",
+        L" 8KHz Dongle",
+        L" 8000Hz Dongle",
+        L" 4K Dongle",
+        L" Dongle",
+        L" Receiver",
+        L" (Wired)",
+        L" (Wireless)",
+        L" Wired",
+        L" Wireless",
+    };
+    bool stripped = true;
+    while (stripped) {
+        stripped = false;
+        for (const wchar_t* suffix : kSuffixes) {
+            size_t l = wcslen(suffix);
+            if (n.size() > l && n.compare(n.size() - l, l, suffix) == 0) {
+                n = n.substr(0, n.size() - l);
+                stripped = true;
+                break;
+            }
+        }
     }
     if (n.empty()) n = L"Razer device";
     return n;
@@ -157,9 +183,10 @@ void PollRazer(PollContext& ctx) {
                 ctx.Add(s, vid, pid);
             } else {
                 ctx.Claim(vid, pid);
-                if (!existing->connected && s.connected) {
+                if ((!existing->connected && s.connected) || (!existing->charging && s.charging && s.connected)) {
                     existing->connected = true;
                     existing->percent = s.percent;
+                    existing->via = s.via;
                 }
                 existing->charging |= s.charging;
             }

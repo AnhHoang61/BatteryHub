@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cwchar>
 #include <map>
@@ -22,11 +23,8 @@
 #include "i18n.h"
 #include "json_output.h"
 #include "labels.h"
-#include "report.h"
 #include "rename_dialog.h"
 #include "widget.h"
-#include "update_win.h"
-#include "update_apply.h"
 
 namespace {
 
@@ -36,6 +34,7 @@ constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
 constexpr UINT_PTR TIMER_ALERT_ICON = 3;
+constexpr UINT_PTR TIMER_PROMOTE = 4;
 // "Check battery every" choices in seconds; 60 is the default. A poll resets an awake device's sleep timer,
 // so a device only sleeps if its timer is shorter than the interval.
 constexpr DWORD POLL_SECONDS[] = { 30, 60, 120, 300, 600, 900, 1800, 3600 };
@@ -44,10 +43,10 @@ constexpr UINT PLACEHOLDER_ID = 1;
 constexpr UINT ALERT_ICON_ID = 2;
 
 enum MenuId : UINT {
-    ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
+    // 为什么这么做：个人定制版无需联网检查更新、赞助和设备支持上报入口，精简掉相关菜单 ID 与模块
+    ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY,
     ID_BRAND_COLORS, ID_STACKED, ID_SHOW_DISCONNECTED, ID_RECORD_HISTORY, ID_DIM_SLEEPING,
     ID_POLL_FIRST = 500,  // "Check battery every": ID_POLL_FIRST + 0..7
-    ID_UPDATE = 200, ID_AUTO_UPDATE,
     ID_LANG_AUTO = 400, ID_LANG_ADD, ID_LANG_FIRST,  // "Language": ID_LANG_FIRST + 0..63
     ID_MONITOR_ALL = 300, ID_MONITOR_MAIN, ID_MONITOR_FIRST,  // "Show the widget on": ID_MONITOR_FIRST + 0..31
     ID_DEVICE_FIRST = 1000
@@ -68,7 +67,7 @@ HWND g_hwnd;
 HANDLE g_refreshEvt, g_stopEvt, g_worker;
 UINT g_taskbarCreatedMsg;
 bool g_lightTaskbar;
-bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
+bool g_wantWidget = false;     // 为什么这么做：默认启用托盘模式（天然适配 Lyricify 等任务栏歌词，互不重叠）
 bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
 bool g_showDisconnectedDevices = false;  // opt-in, explicit driver-reported offline devices only
@@ -77,7 +76,7 @@ bool g_recordHistory = true;  // save readings for "Battery history..." (menu op
 std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all", "main" or one monitor id
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 bool g_stacked = false;      // icon above the percentage (menu option)
-bool g_brandColors = false;  // off by default; known brands get their color (Razer green, Logitech blue, ...)
+bool g_brandColors = true;   // 为什么这么做：默认开启 32 品牌专属色，开箱即用即可区分品牌与设备
 std::atomic<DWORD> g_pollIntervalMs{ 60 * 1000 };  // set from the menu, read by the worker thread
 
 struct TrayEntry {
@@ -264,7 +263,7 @@ void SaveAlertThresholds() {
                     multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
 }
 
-bool LoadWidgetMode() { return LoadBoolSetting(L"TaskbarWidget", true); }
+bool LoadWidgetMode() { return LoadBoolSetting(L"TaskbarWidget", false); }
 void SaveWidgetMode(bool on) { SaveBoolSetting(L"TaskbarWidget", on); }
 bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false); }
 void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
@@ -293,7 +292,7 @@ void SetWidgetMonitor(const std::wstring& v) {
 }
 bool LoadStacked() { return LoadBoolSetting(L"StackedLayout", false); }
 void SaveStacked(bool on) { SaveBoolSetting(L"StackedLayout", on); }
-bool LoadBrandColors() { return LoadBoolSetting(L"BrandColors", false); }
+bool LoadBrandColors() { return LoadBoolSetting(L"BrandColors", true); }
 void SaveBrandColors(bool on) { SaveBoolSetting(L"BrandColors", on); }
 DWORD LoadPollSeconds() {
     DWORD v = 60, sz = sizeof(v);
@@ -323,47 +322,102 @@ void SetAutostart(bool on) {
     RegCloseKey(k);
 }
 
+// 为什么这么做：尊重用户自主选择——首次发给他人使用时不擅自写入注册表开机自启；仅当用户已勾选开机自启后移动了 EXE 位置，才自动同步新路径
+void EnsureAutostart() {
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD bsz = sizeof(buf);
+    bool hasRunValue = RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, buf, &bsz) == ERROR_SUCCESS;
+    if (hasRunValue && _wcsicmp(buf, (L"\"" + ExePath() + L"\"").c_str()) != 0) SetAutostart(true);
+}
+
+// 为什么这么做：开启 Windows 11 Efficiency Mode（EcoQoS）并降低进程优先级，确保后台常驻耗电与 CPU 占用极低
+void EnableLowResourceMode() {
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    struct PowerThrottleState {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    };
+    using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    static auto setInfo = (SetProcessInformationFn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation");
+    if (setInfo) {
+        PowerThrottleState state{ 1, 0x1, 0x1 };  // PROCESS_POWER_THROTTLING_CURRENT_VERSION / EXECUTION_SPEED
+        setInfo(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &state, sizeof(state));
+    }
+}
+
+// 为什么这么做：每次设备枚举/图标重绘后修剪工作集，将 SetupAPI/HID/GDI 临时物理内存页立即交还系统
+void TrimWorkingSet() {
+    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+}
+
 // ---- icon rendering ---------------------------------------------------------------------------
-// Draws the percentage as large digits with a small level bar underneath. GDI text is rendered
-// white-on-black into a scratch bitmap and its brightness is used as the alpha channel, which
-// gives smooth edges on the transparent icon.
+// Draws the percentage as large digits with a small level bar underneath (or stacked device glyph
+// above percentage when g_stacked is enabled). GDI text is rendered white-on-black into a scratch
+// bitmap and its brightness is used as the alpha channel, which gives smooth edges on the icon.
 
 struct Rgb { BYTE r, g, b; };
 
-HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barColor, bool dim) {
+struct InkMask {
+    int w = 0, h = 0;
+    std::vector<BYTE> a;
+};
+
+// 为什么这么做：与 widget.cpp 保持一致，在系统托盘图标上半区绘制对应设备形态的图形
+wchar_t TrayGlyph(DeviceKind k, bool bluetooth) {
+    switch (k) {
+        case DeviceKind::Headset:    return 0xE7F6;  // Headphone
+        case DeviceKind::Mouse:      return 0xE962;  // Mouse
+        case DeviceKind::Keyboard:   return 0xE765;  // KeyboardClassic
+        case DeviceKind::Gamepad:    return 0xE7FC;  // Game
+        case DeviceKind::Phone:      return 0xE8EA;  // CellPhone
+        case DeviceKind::Microphone: return 0xE720;  // Microphone
+        default:                     return bluetooth ? 0xE702 : 0xE772;  // Bluetooth / Devices
+    }
+}
+
+int TrayIconSize() {
     HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
     UINT dpi = taskbar ? GetDpiForWindow(taskbar) : 0;
-    const int S = GetSystemMetricsForDpi(SM_CXSMICON, dpi ? dpi : GetDpiForSystem());
-    const int barH = std::max(2, S / 8);
-    const int textH = S - barH - 1;
+    return GetSystemMetricsForDpi(SM_CXSMICON, dpi ? dpi : GetDpiForSystem());
+}
 
-    HDC dc = CreateCompatibleDC(nullptr);
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
+// 为什么这么做：优先选用 Win11 现代字体（如 Segoe UI Variable Text / Segoe Fluent Icons），在缺失时回退标准字体避免 GDI 静默替换
+const wchar_t* ResolveFontFace(HDC dc, const wchar_t* primary, const wchar_t* fallback) {
+    if (!fallback) return primary;
+    for (const wchar_t* f : { primary, fallback }) {
+        HFONT h = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              ANTIALIASED_QUALITY, DEFAULT_PITCH, f);
+        HGDIOBJ o = SelectObject(dc, h);
+        wchar_t got[LF_FACESIZE] = {};
+        GetTextFaceW(dc, LF_FACESIZE, got);
+        SelectObject(dc, o);
+        DeleteObject(h);
+        if (!_wcsicmp(got, f) || f == fallback) return f;
+    }
+    return fallback;
+}
 
-    // scratch bitmap for the glyphs
-    const int W = S * 3, H = S * 2;
-    bi.bmiHeader.biWidth = W;
-    bi.bmiHeader.biHeight = -H;
-    void* sbits = nullptr;
-    HBITMAP scratch = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &sbits, nullptr, 0);
-    HGDIOBJ oldBmp = SelectObject(dc, scratch);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
+// 为什么这么做：4x 超采样抗锯齿（SSAA）先在 4 倍分辨率画布渲染再居中盒式降采样与伽马补偿（0.82），消除小像素 GDI 网格微调锯齿，使字体与图标更顺滑
+InkMask RenderInkMask(HDC dc, void* sbits, int W, int H, const std::wstring& s, int maxW, int maxH, int weight,
+                      const wchar_t* face, int charExtra = 0) {
+    constexpr int SS = 4;
+    const int hiMaxW = maxW * SS;
+    const int hiMaxH = maxH * SS;
+    InkMask mask;
     auto* sp = static_cast<DWORD*>(sbits);
-
     int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
-    for (int fh = textH * 2; fh >= 6; fh--) {
-        HFONT f = CreateFontW(-fh, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    const int drawX = std::max(8, W / 8);
+    const int drawY = std::max(4, H / 8);
+    for (int fh = hiMaxH * 2; fh >= 6 * SS; fh -= 2) {
+        HFONT f = CreateFontW(-fh, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
         HGDIOBJ oldF = SelectObject(dc, f);
-        SetTextCharacterExtra(dc, text.size() >= 3 ? -1 : 0);
+        SetTextCharacterExtra(dc, charExtra * SS);
         memset(sbits, 0, (size_t)W * H * 4);
-        TextOutW(dc, 2, 0, text.c_str(), (int)text.size());
+        TextOutW(dc, drawX, drawY, s.c_str(), (int)s.size());
         GdiFlush();
+        SetTextCharacterExtra(dc, 0);
         SelectObject(dc, oldF);
         DeleteObject(f);
         bx0 = W; by0 = H; bx1 = -1; by1 = -1;
@@ -371,41 +425,38 @@ HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barCol
             for (int x = 0; x < W; x++)
                 if (sp[y * W + x] & 0xFF) { bx0 = std::min(bx0, x); bx1 = std::max(bx1, x); by0 = std::min(by0, y); by1 = std::max(by1, y); }
         if (bx1 < 0) break;
-        if (bx1 - bx0 + 1 <= S && by1 - by0 + 1 <= textH) break;
+        if (bx1 - bx0 + 1 <= hiMaxW && by1 - by0 + 1 <= hiMaxH) break;
     }
-
-    // final icon bitmap
-    bi.bmiHeader.biWidth = S;
-    bi.bmiHeader.biHeight = -S;
-    void* ibits = nullptr;
-    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &ibits, nullptr, 0);
-    auto* ip = static_cast<DWORD*>(ibits);
-    memset(ip, 0, (size_t)S * S * 4);
-    const int alphaScale = dim ? 140 : 255;
-    auto put = [&](int x, int y, Rgb c, int a) {
-        if (x < 0 || y < 0 || x >= S || y >= S || a <= 0) return;
-        a = a * alphaScale / 255;
-        ip[y * S + x] = ((DWORD)a << 24) | ((DWORD)c.r << 16) | ((DWORD)c.g << 8) | c.b;  // straight alpha
-    };
     if (bx1 >= 0) {
-        int gw = bx1 - bx0 + 1, gh = by1 - by0 + 1;
-        int ox = (S - gw) / 2, oy = (textH - gh) / 2;
-        for (int y = 0; y < gh; y++)
-            for (int x = 0; x < gw; x++)
-                put(ox + x, oy + y, textColor, sp[(by0 + y) * W + (bx0 + x)] & 0xFF);
-    }
-    // level bar: faint track + filled part
-    int fill = barPct < 0 ? 0 : std::max(barPct > 0 ? 1 : 0, (barPct * S + 50) / 100);
-    for (int y = S - barH; y < S; y++)
-        for (int x = 0; x < S; x++) {
-            if (x < fill) put(x, y, barColor, 255);
-            else put(x, y, g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }, 70);
+        int hw = bx1 - bx0 + 1;
+        int hh = by1 - by0 + 1;
+        mask.w = (hw + SS - 1) / SS;
+        mask.h = (hh + SS - 1) / SS;
+        int padX = (mask.w * SS - hw) / 2;
+        int padY = (mask.h * SS - hh) / 2;
+        mask.a.resize((size_t)mask.w * mask.h);
+        for (int ty = 0; ty < mask.h; ty++) {
+            for (int tx = 0; tx < mask.w; tx++) {
+                int sum = 0;
+                for (int ky = 0; ky < SS; ky++) {
+                    int sy = ty * SS + ky - padY;
+                    if (sy < 0 || sy >= hh) continue;
+                    for (int kx = 0; kx < SS; kx++) {
+                        int sx = tx * SS + kx - padX;
+                        if (sx < 0 || sx >= hw) continue;
+                        sum += static_cast<int>(sp[(by0 + sy) * W + (bx0 + sx)] & 0xFF);
+                    }
+                }
+                double v = static_cast<double>(sum) / (SS * SS * 255.0);
+                int out = v <= 0.0 ? 0 : static_cast<int>(std::lround(std::pow(v, 0.82) * 255.0));
+                mask.a[(size_t)ty * mask.w + tx] = static_cast<BYTE>(std::clamp(out, 0, 255));
+            }
         }
+    }
+    return mask;
+}
 
-    SelectObject(dc, oldBmp);
-    DeleteObject(scratch);
-    DeleteDC(dc);
-
+HICON BuildIconFromRgba(HBITMAP color, int S) {
     HBITMAP mask = CreateBitmap(S, S, 1, 1, nullptr);
     {
         HDC mdc = CreateCompatibleDC(nullptr);
@@ -421,21 +472,288 @@ HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barCol
     return icon;
 }
 
+// 为什么这么做：Segoe Fluent Icons 的 0xE945 为空心细线轮廓，在 7~10px 小尺寸托盘中会因降采样而变暗发虚；
+// 直接用 4x4 解析亚像素点阵光栅化实心闪电六边形，在 16x16 与高分屏托盘下都能保持边缘锐利、高饱和醒目
+InkMask RenderBoltMask(int w, int h) {
+    InkMask m;
+    if (w <= 0 || h <= 0) return m;
+    m.w = w;
+    m.h = h;
+    m.a.assign((size_t)w * h, 0);
+    static constexpr float kPts[][2] = {
+        { 0.64f, 0.00f }, { 0.08f, 0.55f }, { 0.48f, 0.55f },
+        { 0.34f, 1.00f }, { 0.92f, 0.43f }, { 0.52f, 0.43f },
+    };
+    constexpr int n = sizeof(kPts) / sizeof(kPts[0]);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int hits = 0;
+            for (int sy = 0; sy < 4; sy++) {
+                float py = (y + (sy + 0.5f) * 0.25f) / h;
+                for (int sx = 0; sx < 4; sx++) {
+                    float px = (x + (sx + 0.5f) * 0.25f) / w;
+                    bool inside = false;
+                    for (int i = 0, j = n - 1; i < n; j = i++) {
+                        float xi = kPts[i][0], yi = kPts[i][1];
+                        float xj = kPts[j][0], yj = kPts[j][1];
+                        if (((yi > py) != (yj > py)) &&
+                            (px < (xj - xi) * (py - yi) / (yj - yi + 1e-6f) + xi))
+                            inside = !inside;
+                    }
+                    if (inside) hits++;
+                }
+            }
+            m.a[(size_t)y * w + x] = static_cast<BYTE>(hits * 255 / 16);
+        }
+    }
+    return m;
+}
+
+// 为什么这么做：方案 3（默认托盘模式），底层绘制品牌色设备大水印，中层加 3x3 加权柔滑镂空隔离带，顶层叠印 4x SSAA 平滑数字、充电闪电标与底部进度条
+HICON RenderIcon(wchar_t glyph, const std::wstring& text, int barPct, Rgb textColor, Rgb glyphColor, Rgb barColor, bool charging, bool dim) {
+    constexpr int SS = 4;
+    const int S = TrayIconSize();
+    const int barH = std::max(2, S / 8);
+    const int canvasH = S - barH - 1;
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    // 4x supersampled scratch bitmap
+    const int W = S * 3 * SS, H = S * 2 * SS;
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    void* sbits = nullptr;
+    HBITMAP scratch = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &sbits, nullptr, 0);
+    HGDIOBJ oldBmp = SelectObject(dc, scratch);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+
+    const wchar_t* textFace = ResolveFontFace(dc, L"Segoe UI Variable Text", L"Segoe UI");
+    InkMask iconMask;
+    if (glyph != 0) {
+        const wchar_t* iconFace = ResolveFontFace(dc, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
+        iconMask = RenderInkMask(dc, sbits, W, H, std::wstring(1, glyph), S, canvasH, FW_NORMAL, iconFace);
+    }
+    InkMask boltMask;
+    if (charging) {
+        // 为什么这么做：充电时在右上角绘制实心 4x SSAA 闪电角标，避免挤压底部有限像素同时保持品牌水印可辨识
+        boltMask = RenderBoltMask(std::max(5, S * 26 / 100), std::max(7, canvasH * 42 / 100));
+    }
+    const int textMaxW = glyph != 0 ? std::max(8, S - 2) : S;
+    const int textMaxH = glyph != 0 ? std::max(8, canvasH * 58 / 100) : canvasH;
+    InkMask textMask = RenderInkMask(dc, sbits, W, H, text, textMaxW, textMaxH, FW_SEMIBOLD, textFace, text.size() >= 3 ? -1 : 0);
+
+    // final icon bitmap
+    bi.bmiHeader.biWidth = S;
+    bi.bmiHeader.biHeight = -S;
+    void* ibits = nullptr;
+    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &ibits, nullptr, 0);
+    auto* ip = static_cast<DWORD*>(ibits);
+    memset(ip, 0, (size_t)S * S * 4);
+    // 为什么这么做：休眠时适度降低不透明度但仍保留充足亮度（185/255），确保仍可一眼分辨品牌色与设备轮廓
+    const int alphaScale = dim ? 185 : 255;
+    auto blendOver = [&](int x, int y, Rgb c, int sa) {
+        if (x < 0 || y < 0 || x >= S || y >= S || sa <= 0) return;
+        sa = sa * alphaScale / 255;
+        if (sa <= 0) return;
+        DWORD dst = ip[y * S + x];
+        int da = (dst >> 24) & 0xFF;
+        if (da == 0) {
+            ip[y * S + x] = ((DWORD)sa << 24) | ((DWORD)c.r << 16) | ((DWORD)c.g << 8) | c.b;  // straight alpha
+            return;
+        }
+        int dr = (dst >> 16) & 0xFF, dg = (dst >> 8) & 0xFF, db = dst & 0xFF;
+        int inv = 255 - sa;
+        int outA = sa + da * inv / 255;
+        if (outA <= 0) { ip[y * S + x] = 0; return; }
+        int outR = (c.r * sa + dr * da * inv / 255) / outA;
+        int outG = (c.g * sa + dg * da * inv / 255) / outA;
+        int outB = (c.b * sa + db * da * inv / 255) / outA;
+        ip[y * S + x] = ((DWORD)std::min(255, outA) << 24) | ((DWORD)std::min(255, outR) << 16) | ((DWORD)std::min(255, outG) << 8) | std::min(255, outB);
+    };
+
+    // 第一层：底层满幅品牌色设备大图标水印（充电时依然维持品牌色用于区分设备）
+    if (iconMask.h > 0) {
+        int ix = (S - iconMask.w) / 2;
+        int iy = (canvasH - iconMask.h) / 2;
+        for (int y = 0; y < iconMask.h; y++)
+            for (int x = 0; x < iconMask.w; x++) {
+                int wa = iconMask.a[(size_t)y * iconMask.w + x] * 200 / 255;
+                blendOver(ix + x, iy + y, glyphColor, wa);
+            }
+    }
+
+    // 第二层与第三层：3x3 加权柔滑镂空隔离带 + 顶层 4x SSAA 数字（及右上角闪电标）
+    const int tx = textMask.h > 0 ? (S - textMask.w) / 2 : 0;
+    const int ty = textMask.h > 0 ? (glyph != 0 ? std::min(canvasH - textMask.h, (canvasH - textMask.h) / 2 + 1) : (canvasH - textMask.h) / 2) : 0;
+    const int bx = S - boltMask.w;
+    const int by = 0;
+    if (glyph != 0 && (textMask.h > 0 || boltMask.h > 0)) {
+        std::vector<BYTE> halo((size_t)S * S, 0);
+        auto stampHalo = [&](const InkMask& m, int ox, int oy) {
+            for (int y = 0; y < m.h; y++)
+                for (int x = 0; x < m.w; x++) {
+                    BYTE ma = m.a[(size_t)y * m.w + x];
+                    if (ma < 24) continue;
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dx = -1; dx <= 1; dx++) {
+                            int hx = ox + x + dx, hy = oy + y + dy;
+                            if (hx >= 0 && hx < S && hy >= 0 && hy < canvasH) {
+                                int w = (dx != 0 && dy != 0) ? 166 : 255;
+                                BYTE hv = static_cast<BYTE>(ma * w / 255);
+                                halo[(size_t)hy * S + hx] = std::max(halo[(size_t)hy * S + hx], hv);
+                            }
+                        }
+                }
+        };
+        if (textMask.h > 0) stampHalo(textMask, tx, ty);
+        if (boltMask.h > 0) stampHalo(boltMask, bx, by);
+        Rgb haloBg = g_lightTaskbar ? Rgb{ 240, 240, 240 } : Rgb{ 16, 16, 16 };
+        for (int y = 0; y < canvasH; y++)
+            for (int x = 0; x < S; x++) {
+                int h = halo[(size_t)y * S + x];
+                if (h == 0) continue;
+                DWORD& dst = ip[y * S + x];
+                int da = (dst >> 24) & 0xFF;
+                if (da > 0) {
+                    int dr = (dst >> 16) & 0xFF, dg = (dst >> 8) & 0xFF, db = dst & 0xFF;
+                    int newA = da * (255 - h * 195 / 255) / 255;
+                    int tint = h * 3 / 4;
+                    int nr = (dr * (255 - tint) + haloBg.r * tint) / 255;
+                    int ng = (dg * (255 - tint) + haloBg.g * tint) / 255;
+                    int nb = (db * (255 - tint) + haloBg.b * tint) / 255;
+                    dst = ((DWORD)newA << 24) | ((DWORD)nr << 16) | ((DWORD)ng << 8) | nb;
+                }
+            }
+    }
+    auto blendMask = [&](const InkMask& m, int ox, int oy, Rgb c) {
+        for (int y = 0; y < m.h; y++)
+            for (int x = 0; x < m.w; x++)
+                blendOver(ox + x, oy + y, c, m.a[(size_t)y * m.w + x]);
+    };
+    if (textMask.h > 0) blendMask(textMask, tx, ty, textColor);
+    if (boltMask.h > 0) blendMask(boltMask, bx, by, textColor);
+
+    // level bar: faint track + filled part
+    int fill = barPct < 0 ? 0 : std::max(barPct > 0 ? 1 : 0, (barPct * S + 50) / 100);
+    for (int y = S - barH; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            if (x < fill) blendOver(x, y, barColor, 255);
+            else blendOver(x, y, g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }, 70);
+        }
+
+    SelectObject(dc, oldBmp);
+    DeleteObject(scratch);
+    DeleteDC(dc);
+
+    return BuildIconFromRgba(color, S);
+}
+
+// 为什么这么做：方案 B1（单格上下排布），在正方形托盘槽位内以 4x SSAA 渲染上方品牌色设备图标（充电时旁附闪电标）与下方平滑百分比数字
+HICON RenderStackedIcon(wchar_t glyph, const std::wstring& text, Rgb iconColor, Rgb textColor, bool charging, bool dim) {
+    constexpr int SS = 4;
+    const int S = TrayIconSize();
+    const int gap = 1;
+    const int iconBoxH = (S - gap) / 2;
+    const int textBoxH = S - gap - iconBoxH;
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    const int W = S * 3 * SS, H = S * 2 * SS;
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    void* sbits = nullptr;
+    HBITMAP scratch = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &sbits, nullptr, 0);
+    HGDIOBJ oldBmp = SelectObject(dc, scratch);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+
+    const wchar_t* textFace = ResolveFontFace(dc, L"Segoe UI Variable Text", L"Segoe UI");
+    const wchar_t* iconFace = ResolveFontFace(dc, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
+    InkMask iconMask = RenderInkMask(dc, sbits, W, H, std::wstring(1, glyph), S, iconBoxH, FW_NORMAL, iconFace);
+    InkMask boltMask;
+    if (charging) {
+        boltMask = RenderBoltMask(std::max(5, S * 28 / 100), std::max(7, iconBoxH * 85 / 100));
+    }
+    InkMask textMask = RenderInkMask(dc, sbits, W, H, text, S, textBoxH, FW_SEMIBOLD, textFace, text.size() >= 3 ? -1 : 0);
+
+    bi.bmiHeader.biWidth = S;
+    bi.bmiHeader.biHeight = -S;
+    void* ibits = nullptr;
+    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &ibits, nullptr, 0);
+    auto* ip = static_cast<DWORD*>(ibits);
+    memset(ip, 0, (size_t)S * S * 4);
+    const int alphaScale = dim ? 185 : 255;
+    auto put = [&](int x, int y, Rgb c, int a) {
+        if (x < 0 || y < 0 || x >= S || y >= S || a <= 0) return;
+        a = a * alphaScale / 255;
+        ip[y * S + x] = ((DWORD)a << 24) | ((DWORD)c.r << 16) | ((DWORD)c.g << 8) | c.b;
+    };
+
+    const int topH = std::max(iconMask.h, boltMask.h);
+    const int activeGap = (topH > 0 && textMask.h > 0) ? gap : 0;
+    const int totalH = topH + activeGap + textMask.h;
+    const int topY = std::max(0, (S - totalH) / 2);
+    auto blit = [&](const InkMask& m, int ox, int oy, Rgb c) {
+        for (int y = 0; y < m.h; y++)
+            for (int x = 0; x < m.w; x++)
+                put(ox + x, oy + y, c, m.a[(size_t)y * m.w + x]);
+    };
+    if (iconMask.h > 0 && boltMask.h > 0) {
+        const int pairGap = 1;
+        const int rowW = iconMask.w + pairGap + boltMask.w;
+        const int ix = std::max(0, (S - rowW) / 2);
+        const int bx = std::min(S - boltMask.w, ix + iconMask.w + pairGap);
+        blit(iconMask, ix, topY + (topH - iconMask.h) / 2, iconColor);
+        blit(boltMask, bx, topY + (topH - boltMask.h) / 2, textColor);
+    } else if (iconMask.h > 0) {
+        blit(iconMask, (S - iconMask.w) / 2, topY, iconColor);
+    } else if (boltMask.h > 0) {
+        blit(boltMask, (S - boltMask.w) / 2, topY, textColor);
+    }
+    if (textMask.h > 0) blit(textMask, (S - textMask.w) / 2, topY + topH + activeGap, textColor);
+
+    SelectObject(dc, oldBmp);
+    DeleteObject(scratch);
+    DeleteDC(dc);
+
+    return BuildIconFromRgba(color, S);
+}
+
 Rgb Foreground() { return g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }; }
 
 Accent AccentFor(const DeviceStatus& s) { return g_brandColors ? BrandOf(s) : Accent::None; }
 
-HICON IconFor(int pct, bool charging, bool dim, Accent accent) {
+HICON IconFor(int pct, bool charging, bool dim, Accent accent, DeviceKind kind, bool bluetooth) {
     Rgb fg = Foreground();
     BrandColor bc = AccentColor(accent, g_lightTaskbar);
-    Rgb bar = charging        ? Rgb{ 0, 170, 255 }
-            : pct <= LOW_BATTERY ? Rgb{ 232, 32, 48 }
-            : pct <= 30       ? Rgb{ 255, 150, 0 }
-            : accent != Accent::None ? Rgb{ bc.r, bc.g, bc.b }
-                              : Rgb{ 30, 190, 90 };
-    Rgb text = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 } : fg;
+    const Rgb chargeGreen = g_lightTaskbar ? Rgb{ 12, 152, 58 } : Rgb{ 56, 232, 112 };
+    // 为什么这么做：充电时保留设备品牌色（glyphColor）便于区分同框多设备，同时将数字、充电条与闪电角标统一为高对比充电绿
+    Rgb glyphColor = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 232, 32, 48 }
+                   : (!charging && pct >= 0 && pct <= 30)          ? Rgb{ 255, 150, 0 }
+                   : accent != Accent::None                        ? Rgb{ bc.r, bc.g, bc.b }
+                                                                   : Rgb{ 30, 190, 90 };
+    Rgb barColor = charging ? chargeGreen : glyphColor;
     std::wstring t = pct < 0 ? L"?" : std::to_wstring(pct);
-    return RenderIcon(t, pct, text, bar, dim);
+    Rgb textColor = charging                         ? chargeGreen
+                  : (pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 }
+                                                     : fg;
+    if (g_stacked) {
+        // 为什么这么做：B1 模式下顶部设备图标维持品牌/告警色，充电时旁附绿色闪电标且下方数字同步变为绿色
+        return RenderStackedIcon(TrayGlyph(kind, bluetooth), t, glyphColor, textColor, charging, dim);
+    }
+    // 为什么这么做：方案 3（底层品牌色设备大水印 + 3x3 柔滑镂空隔离带 + 顶层数字/闪电角标 + 底部进度条）同时兼顾设备辨识度与充电状态一目了然
+    return RenderIcon(TrayGlyph(kind, bluetooth), t, pct, textColor, glyphColor, barColor, charging, dim);
 }
 
 // ---- tray management --------------------------------------------------------------------------
@@ -479,7 +797,53 @@ void TrayCall(DWORD msg, UINT uid, HICON icon, const std::wstring& tip, const wc
     if (msg == NIM_ADD) {
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        // 为什么这么做：新注册的 Win11 托盘图标默认折叠在 ^ 中，延迟 1.5 秒后将其自动固定到下方任务栏（不覆盖用户手动拖回的设置）
+        if (uid != ALERT_ICON_ID && g_hwnd) SetTimer(g_hwnd, TIMER_PROMOTE, 1500, nullptr);
     }
+}
+
+// 为什么这么做：仅针对当前运行 EXE 尚未设置过 IsPromoted 的新托盘图标自动写入 1，移入下方任务栏；若用户手动拖回 ^（IsPromoted=0）则尊重用户选择
+void PromoteOwnTrayIcons() {
+    std::wstring exe = ExePath();
+    size_t slash = exe.find_last_of(L"\\/");
+    std::wstring base = (slash != std::wstring::npos) ? exe.substr(slash + 1) : exe;
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ, &root) != ERROR_SUCCESS) return;
+    DWORD idx = 0;
+    wchar_t subName[128] = {};
+    DWORD subLen = ARRAYSIZE(subName);
+    while (RegEnumKeyExW(root, idx++, subName, &subLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+        subLen = ARRAYSIZE(subName);
+        HKEY sub = nullptr;
+        if (RegOpenKeyExW(root, subName, 0, KEY_READ | KEY_SET_VALUE, &sub) != ERROR_SUCCESS) continue;
+        wchar_t path[MAX_PATH * 2] = {};
+        DWORD pathSz = sizeof(path);
+        if (RegGetValueW(sub, nullptr, L"ExecutablePath", RRF_RT_REG_SZ, nullptr, path, &pathSz) == ERROR_SUCCESS && path[0]) {
+            bool match = (_wcsicmp(path, exe.c_str()) == 0);
+            if (!match && path[0] == L'{') {
+                size_t pl = wcslen(path);
+                if (pl > base.size() + 1 && path[pl - base.size() - 1] == L'\\' &&
+                    _wcsicmp(path + pl - base.size(), base.c_str()) == 0) {
+                    DWORD uid = 0, uidSz = sizeof(uid);
+                    if (RegGetValueW(sub, nullptr, L"UID", RRF_RT_REG_DWORD, nullptr, &uid, &uidSz) == ERROR_SUCCESS) {
+                        for (const auto& [k, e] : g_entries) {
+                            if (e.added && e.uid == uid) { match = true; break; }
+                        }
+                        if (!match && g_placeholder && uid == PLACEHOLDER_ID) match = true;
+                    }
+                }
+            }
+            if (match) {
+                DWORD promoted = 0, pSz = sizeof(promoted);
+                if (RegGetValueW(sub, nullptr, L"IsPromoted", RRF_RT_REG_DWORD, nullptr, &promoted, &pSz) != ERROR_SUCCESS) {
+                    DWORD one = 1;
+                    RegSetValueExW(sub, L"IsPromoted", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one), sizeof(one));
+                }
+            }
+        }
+        RegCloseKey(sub);
+    }
+    RegCloseKey(root);
 }
 
 void TrayDelete(UINT uid) {
@@ -499,7 +863,7 @@ void ShowBatteryAlert(TrayEntry& e) {
     }
     // Windows notification balloons need a tray icon. Keep a temporary one in widget mode
     // long enough for the shell to display the notification, then remove it.
-    if (!g_placeholderIcon) g_placeholderIcon = RenderIcon(L"-", -1, Foreground(), Foreground(), true);
+    if (!g_placeholderIcon) g_placeholderIcon = RenderIcon(0, L"-", -1, Foreground(), Foreground(), Foreground(), false, true);
     TrayCall(g_alertIconAdded ? NIM_MODIFY : NIM_ADD, ALERT_ICON_ID, g_placeholderIcon,
              L"BatteryHub", title.c_str(), message);
     g_alertIconAdded = true;
@@ -514,7 +878,7 @@ void UpdatePlaceholder() {
     bool any = false;
     for (auto& [k, e] : g_entries) any |= e.added;
     if (!any && !g_placeholder) {
-        if (!g_placeholderIcon) g_placeholderIcon = RenderIcon(L"-", -1, Foreground(), Foreground(), true);
+        if (!g_placeholderIcon) g_placeholderIcon = RenderIcon(0, L"-", -1, Foreground(), Foreground(), Foreground(), false, true);
         TrayCall(NIM_ADD, PLACEHOLDER_ID, g_placeholderIcon, std::wstring(L"BatteryHub\n") + T(L"No devices with battery info found"));
         g_placeholder = true;
     } else if (any && g_placeholder) {
@@ -536,12 +900,17 @@ void ApplyEntry(TrayEntry& e) {
     // Fully charged on power: the normal green bar instead of the blue charging one.
     bool charging = s.connected && !s.asleep && s.charging && !s.full && shown < 100;
     Accent accent = AccentFor(s);
+    bool bluetooth = (s.via == L"Bluetooth");
     std::wstring sig = std::to_wstring(shown) + (charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k") +
-                       L"a" + std::to_wstring((int)accent) + (s.connected ? L"|on" : L"|off");
+                       L"a" + std::to_wstring((int)accent) + (g_stacked ? L"s1" : L"s0") +
+                       L"k" + std::to_wstring((int)s.kind) + (bluetooth ? L"b" : L"") + (s.connected ? L"|on" : L"|off");
     if (sig != e.iconSig || !e.icon) {
         if (e.icon) DestroyIcon(e.icon);
-        e.icon = s.connected ? IconFor(shown, charging, dim, accent)
-                             : RenderIcon(L"\u00D7", -1, Foreground(), Foreground(), true);
+        if (s.connected)
+            e.icon = IconFor(shown, charging, dim, accent, s.kind, bluetooth);
+        else
+            e.icon = g_stacked ? RenderStackedIcon(TrayGlyph(s.kind, bluetooth), L"\u00D7", Foreground(), Foreground(), false, true)
+                               : RenderIcon(TrayGlyph(s.kind, bluetooth), L"\u00D7", -1, Foreground(), Foreground(), Foreground(), false, true);
         e.iconSig = sig;
     }
     std::wstring tip = DisplayName(e) + L"\n" + StatusText(e);
@@ -639,9 +1008,18 @@ void OnResults(std::vector<DeviceStatus>& results) {
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
         auto& e = it->second;
+        // 为什么这么做：外设插线充电（如 2.4G 接收器切为 USB 有线或不同 PID）或拔线切换时，设备键会立即变更；
+        // 若同一物理设备已在本次轮询结果里出现，立刻跳过旧键宽限期并删除残影，避免同时显示两个图标
+        bool replacedByOtherKey = false;
+        for (const auto& r : results) {
+            if (r.key != it->first && SamePhysicalDevice(e.st, r)) {
+                replacedByOtherKey = true;
+                break;
+            }
+        }
         // Some receivers drop sleeping devices from the link; keep showing the last value for a while
         // (at least two poll intervals).
-        bool inGrace = !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
+        bool inGrace = !seen.count(it->first) && !replacedByOtherKey && e.st.graceSec > 0 && e.st.connected &&
                        GetTickCount64() - e.lastSeen <
                            std::max<ULONGLONG>((ULONGLONG)e.st.graceSec * 1000, 2ULL * g_pollIntervalMs);
         if (inGrace) {
@@ -659,6 +1037,14 @@ void OnResults(std::vector<DeviceStatus>& results) {
     }
     UpdatePlaceholder();
     UpdateWidget();
+    TrimWorkingSet();
+}
+
+// 为什么这么做：已移除更新模块，仅在桌面悬浮条模式下开启 1 秒定时器，纯托盘模式实现零定时唤醒
+void SyncWidgetTimer() {
+    if (!g_hwnd) return;
+    if (g_wantWidget) SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
+    else KillTimer(g_hwnd, TIMER_WIDGET);
 }
 
 // Makes the actual display match the chosen mode; falls back to tray icons if the taskbar
@@ -682,6 +1068,7 @@ void SetMode(bool useWidget) {
     g_wantWidget = useWidget;
     SaveWidgetMode(useWidget);
     Reconcile();
+    SyncWidgetTimer();
 }
 
 void SetWidgetBackground(bool on) {
@@ -735,6 +1122,7 @@ void RedrawAll() {
     }
     for (auto& [k, e] : g_entries) { e.iconSig.clear(); ApplyEntry(e); }
     UpdatePlaceholder();
+    TrimWorkingSet();
 }
 
 void SetLanguage(const std::wstring& code) {
@@ -746,6 +1134,8 @@ void SetLanguage(const std::wstring& code) {
 void SetStacked(bool on) {
     g_stacked = on;
     SaveStacked(on);
+    // 为什么这么做：托盘模式下切换“图标在百分比上方”时同步重绘托盘图标，可在方案 B1 与方案 A 之间即时切换
+    RedrawAll();
     widget::SetStacked(on);
 }
 
@@ -876,7 +1266,8 @@ void ShowMenu() {
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
     UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
     AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, T(L"Background behind taskbar text (for transparent taskbars)"));
-    AppendMenuW(m, MF_STRING | (g_stacked ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_STACKED, T(L"Icons above percentages (narrower)"));
+    // 为什么这么做：解锁托盘模式下的“Icons above percentages (narrower)”开关，方便在方案 B1 与方案 A 间切换
+    AppendMenuW(m, MF_STRING | (g_stacked ? MF_CHECKED : 0), ID_STACKED, T(L"Icons above percentages (narrower)"));
     // With more than one monitor: choose which taskbars show the widget (all, main only, or one monitor).
     auto monitors = widget::OtherMonitors();
     if (monitors.size() > 31) monitors.resize(31);
@@ -934,13 +1325,6 @@ void ShowMenu() {
     }
     AppendMenuW(m, MF_STRING, ID_REFRESH, T(L"Refresh now"));
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, T(L"Start with Windows"));
-    AppendMenuW(m, MF_STRING, ID_REPORT, T(L"Request support for a device..."));
-    AppendMenuW(m, MF_STRING, ID_SUPPORT, T(L"Support the project..."));
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (updates::Busy() ? MF_GRAYED : 0), ID_UPDATE, updates::MenuLabel().c_str());
-    UINT updateFlags = MF_STRING | (updates::AutomaticEnabled() ? MF_CHECKED : 0) |
-                       (updates::Supported() ? 0 : MF_GRAYED);
-    AppendMenuW(m, updateFlags, ID_AUTO_UPDATE, T(L"Automatically check for updates"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, T(L"Exit"));
     POINT pt;
@@ -966,10 +1350,6 @@ void ShowMenu() {
         case ID_STACKED: SetStacked(!g_stacked); break;
         case ID_MODE_WIDGET: SetMode(true); break;
         case ID_MODE_TRAY: SetMode(false); break;
-        case ID_SUPPORT: ShellExecuteW(nullptr, L"open", L"https://github.com/sponsors/krisgfx9", nullptr, nullptr, SW_SHOWNORMAL); break;
-        case ID_REPORT: report::Show(g_inst, g_hwnd); break;
-        case ID_UPDATE: updates::Activate(g_hwnd); break;
-        case ID_AUTO_UPDATE: updates::ToggleAutomatic(); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
         default:
             if (cmd >= ID_POLL_FIRST && cmd < ID_POLL_FIRST + ARRAYSIZE(POLL_SECONDS)) {
@@ -1103,10 +1483,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         case WM_TIMER:
             if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
-            if (wp == TIMER_WIDGET) { Reconcile(); updates::Tick(h); }
+            if (wp == TIMER_WIDGET) Reconcile();
             if (wp == TIMER_ALERT_ICON) {
                 KillTimer(h, TIMER_ALERT_ICON);
                 if (g_alertIconAdded) { TrayDelete(ALERT_ICON_ID); g_alertIconAdded = false; }
+            }
+            if (wp == TIMER_PROMOTE) {
+                KillTimer(h, TIMER_PROMOTE);
+                PromoteOwnTrayIcons();
             }
             return 0;
         case WM_SETTINGCHANGE:
@@ -1116,9 +1500,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_DESTROY:
-            updates::Shutdown();
             KillTimer(h, TIMER_WIDGET);
             KillTimer(h, TIMER_ALERT_ICON);
+            KillTimer(h, TIMER_PROMOTE);
             if (g_alertIconAdded) { TrayDelete(ALERT_ICON_ID); g_alertIconAdded = false; }
             widget::Destroy();
             SetEvent(g_stopEvt);
@@ -1218,30 +1602,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
                     L"--list   Print devices and battery levels\n"
                     L"--json   Print a JSON array of devices and battery levels\n"
                     L"--dump   Print every HID collection and device\n"
-                    L"--report Open the \"Request support for a device\" window\n"
                     L"--demo   Show sample devices\n"
                     L"--quit   Quit a running instance",
                     L"BatteryHub", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
-    int argc = 0;
-    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    int applyResult = argv ? updates::RunApplyMode(argc, argv) : -1;
-    if (argv) LocalFree(argv);
-    if (applyResult >= 0) return applyResult;
     if (cmdLine && wcsstr(cmdLine, L"--list")) return ListToConsole(false);
     if (cmdLine && wcsstr(cmdLine, L"--dump")) return ListToConsole(true);
-    if (cmdLine && wcsstr(cmdLine, L"--report")) {  // the "Request support for a device" window on its own
-        i18n::Init();
-        report::Show(inst, nullptr);
-        MSG msg;
-        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            if (report::PreTranslate(&msg)) continue;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        return 0;
-    }
     if (cmdLine && wcsstr(cmdLine, L"--quit")) {  // used by the installer before upgrading/uninstalling
         if (HWND w = FindWindowW(L"WirelessBatteryWnd", nullptr)) {
             DWORD pid = 0;
@@ -1259,8 +1626,41 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_demo = cmdLine && wcsstr(cmdLine, L"--demo");
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\WirelessBatteryTray");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-    updates::Initialize();
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 为什么这么做：如果已有不同路径的旧版 BatteryHub 在运行，优雅关闭旧进程后接管，确保双击新打包 EXE 即可直接升级运行
+        HWND oldWnd = FindWindowW(L"WirelessBatteryWnd", nullptr);
+        DWORD oldPid = 0;
+        if (oldWnd) GetWindowThreadProcessId(oldWnd, &oldPid);
+        bool samePath = false;
+        if (oldPid) {
+            HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, oldPid);
+            if (hp) {
+                wchar_t oldPath[MAX_PATH * 2] = {};
+                DWORD sz = ARRAYSIZE(oldPath);
+                if (QueryFullProcessImageNameW(hp, 0, oldPath, &sz))
+                    samePath = (_wcsicmp(oldPath, ExePath().c_str()) == 0);
+                CloseHandle(hp);
+            }
+        }
+        if (samePath || !oldPid) {
+            if (mutex) CloseHandle(mutex);
+            return 0;
+        }
+        HANDLE running = OpenProcess(SYNCHRONIZE, FALSE, oldPid);
+        if (running) {
+            PostMessageW(oldWnd, WM_CLOSE, 0, 0);
+            WaitForSingleObject(running, 5000);
+            CloseHandle(running);
+        }
+        if (mutex) CloseHandle(mutex);
+        mutex = CreateMutexW(nullptr, TRUE, L"Local\\WirelessBatteryTray");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (mutex) CloseHandle(mutex);
+            return 0;
+        }
+    }
+    EnableLowResourceMode();
+    EnsureAutostart();
 
     g_lightTaskbar = ReadLightTaskbar();
     ApplyMenuTheme(g_lightTaskbar);
@@ -1303,12 +1703,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     battery_history::Initialize(g_demo);
     Reconcile();
     UpdatePlaceholder();  // something to click on until the first poll finishes
-    SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
+    SyncWidgetTimer();
+    TrimWorkingSet();
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        if (report::PreTranslate(&m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

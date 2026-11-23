@@ -50,11 +50,7 @@ IRawGameControllerStatics* Statics() {
     return statics;
 }
 
-// Vendors whose controllers report a real battery through Windows.Gaming.Input:
-// Microsoft, and GameSir in Xbox (GIP) mode (e.g. G7 Pro on its receiver, 3537:105E).
-bool WgiVendor(UINT16 vid) { return vid == 0x045E || vid == 0x3537; }
-
-// Adds Xbox controllers with a real percentage. Returns how many were added; `thirdParty` counts
+// Adds controllers with a real percentage via Windows.Gaming.Input. Returns how many were added; `thirdParty` counts
 // the non-Microsoft ones among them.
 int PollWgi(PollContext& ctx, int& thirdParty) {
     thirdParty = 0;
@@ -74,7 +70,8 @@ int PollWgi(PollContext& ctx, int& thirdParty) {
         if (ctx.IsClaimed(vid, pid)) { Release(raw); continue; }  // a vendor driver already reads this pad
         IGameControllerBatteryInfo* info = nullptr;
         IBatteryReport* report = nullptr;
-        if (WgiVendor(vid) && SUCCEEDED(raw->QueryInterface(__uuidof(IGameControllerBatteryInfo), (void**)&info)) && info &&
+        // 为什么这么做：取消 0x045E/0x3537 白名单限制，允许更多第三方蓝牙/无线手柄通过 Windows.Gaming.Input 获取真实电量而非退回 XInput 四档粗略值
+        if (SUCCEEDED(raw->QueryInterface(__uuidof(IGameControllerBatteryInfo), (void**)&info)) && info &&
             SUCCEEDED(info->TryGetBatteryReport(&report)) && report) {
             __FIReference_1_INT32 *rem = nullptr, *full = nullptr;
             report->get_RemainingCapacityInMilliwattHours(&rem);
@@ -147,11 +144,12 @@ const XInputApi& LoadXInput() {
 }  // namespace
 
 void PollXInput(PollContext& ctx) {
-    // An Xbox controller on Bluetooth may already be listed with a real percentage.
-    bool btXbox = false;
-    for (auto& s : ctx.out) btXbox |= s.via == L"Bluetooth" && s.name.find(L"Xbox") != std::wstring::npos;
+    // A Bluetooth gamepad (Xbox or third-party) may already be listed with a real percentage.
+    bool btGamepad = false;
+    for (auto& s : ctx.out)
+        btGamepad |= s.via == L"Bluetooth" && (s.kind == DeviceKind::Gamepad || s.name.find(L"Xbox") != std::wstring::npos);
     int thirdParty = 0;
-    int precise = btXbox ? 0 : PollWgi(ctx, thirdParty);
+    int precise = btGamepad ? 0 : PollWgi(ctx, thirdParty);
     // GameSir pads answer XInput's headset query with their own battery ("Full") even with nothing
     // plugged in, so skip headsets when every precisely shown controller is third-party.
     bool skipHeadset = precise > 0 && thirdParty == precise;
@@ -175,7 +173,7 @@ void PollXInput(PollContext& ctx) {
         XINPUT_BATTERY_INFORMATION pad{};
         const bool hasPad = query(user, BATTERY_DEVTYPE_GAMEPAD, pad);
         for (BYTE type : { (BYTE)BATTERY_DEVTYPE_GAMEPAD, (BYTE)BATTERY_DEVTYPE_HEADSET }) {
-            if (type == BATTERY_DEVTYPE_GAMEPAD && (btXbox || precise > 0)) continue;  // already shown precisely
+            if (type == BATTERY_DEVTYPE_GAMEPAD && (btGamepad || precise > 0)) continue;  // already shown precisely
             if (type == BATTERY_DEVTYPE_HEADSET && skipHeadset) continue;
             XINPUT_BATTERY_INFORMATION bi{};
             if (type == BATTERY_DEVTYPE_GAMEPAD) {

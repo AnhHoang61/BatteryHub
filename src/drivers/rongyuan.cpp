@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <cwctype>
-#include <sstream>
 
 namespace {
 
@@ -34,10 +33,16 @@ bool IsReceiver(USHORT vid, USHORT pid) {
 }
 
 // Product string without link words: "AJAZZ 2.4G 8K" -> "AJAZZ", "2.4G Wireless Receiver" -> "".
+// 为什么这么做：手写空白分词替代 std::wistringstream，消除对 <sstream> 及重型流库代码的静态链接体积开销
 std::wstring Brand(const std::wstring& product) {
-    std::wistringstream in(product);
-    std::wstring word, out;
-    while (in >> word) {
+    std::wstring out;
+    size_t i = 0, n = product.size();
+    while (i < n) {
+        while (i < n && std::iswspace(product[i])) ++i;
+        if (i >= n) break;
+        size_t start = i;
+        while (i < n && !std::iswspace(product[i])) ++i;
+        std::wstring word = product.substr(start, i - start);
         std::wstring u = word;
         for (auto& ch : u) ch = (wchar_t)std::towupper(ch);
         if (u == L"2.4G" || u == L"2.4GHZ" || u == L"8K" || u == L"4K" || u == L"2K" || u == L"1K" || u == L"RECEIVER" ||

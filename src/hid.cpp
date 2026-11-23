@@ -227,15 +227,20 @@ int Interpolate(int mv, const int* mvTable, const int* pctTable, int n) {
 }
 
 DeviceKind GuessKind(const std::wstring& name) {
+    // 为什么这么做：部分蓝牙/接收器手柄（尤其国内第三方品牌和中文系统设备名）未写标准 HID 类别，补充中英文手柄及外设关键词兜底识别
     std::wstring n = name;
     for (auto& ch : n) ch = towlower(ch);
     auto has = [&](const wchar_t* s) { return n.find(s) != std::wstring::npos; };
-    if (has(L"mouse") || has(L"mice") || has(L"trackball")) return DeviceKind::Mouse;
-    if (has(L"keyboard") || has(L"keys")) return DeviceKind::Keyboard;
-    if (has(L"controller") || has(L"gamepad") || has(L"xbox") || has(L"dualsense") || has(L"dualshock") || has(L"joy-con"))
+    if (has(L"mouse") || has(L"mice") || has(L"trackball") || has(L"鼠标")) return DeviceKind::Mouse;
+    if (has(L"keyboard") || has(L"keys") || has(L"键盘")) return DeviceKind::Keyboard;
+    if (has(L"controller") || has(L"gamepad") || has(L"xbox") || has(L"dualsense") || has(L"dualshock") ||
+        has(L"joy-con") || has(L"joycon") || has(L"pro controller") || has(L"8bitdo") || has(L"八位堂") ||
+        has(L"flydigi") || has(L"飞智") || has(L"vader") || has(L"apex") || has(L"gamesir") || has(L"小鸡") ||
+        has(L"beitong") || has(L"北通") || has(L"gulikit") || has(L"谷粒") || has(L"easysmx") ||
+        has(L"raikiri") || has(L"wolverine") || has(L"控制器") || has(L"手柄"))
         return DeviceKind::Gamepad;
     if (has(L"head") || has(L"buds") || has(L"pods") || has(L"ear") || has(L"wh-") || has(L"wf-") || has(L"audio") ||
-        has(L"speaker") || has(L"arctis") || has(L"cloud") || has(L"void") || has(L"virtuoso"))
+        has(L"speaker") || has(L"arctis") || has(L"cloud") || has(L"void") || has(L"virtuoso") || has(L"耳机"))
         return DeviceKind::Headset;
     return DeviceKind::Other;
 }

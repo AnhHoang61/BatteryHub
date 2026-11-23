@@ -147,6 +147,52 @@ int main() {
     std::wstring deep(70,L'[');deep+=L"0";deep+=std::wstring(70,L']');
     assert(!PhoneLink::Parse(deep,reading));
 
+    // Simplified Chinese Phone Link cards (1% precision & disconnected rejection).
+    const std::wstring zhConnected = LR"({
+        "speak": "V2366GA - 已连接到你的电脑",
+        "body": [
+            {"type": "TextBlock", "text": "83%", "tooltip": "电池电量: 83%"}
+        ]
+    })";
+    reading = {};
+    assert(PhoneLink::Parse(zhConnected, reading));
+    assert(reading.name == L"V2366GA");
+    assert(reading.percent == 83);
+    assert(!reading.charging);
+
+    const std::wstring zhCharging = LR"({
+        "speak": "V2366GA - 已连接到电脑",
+        "body": [
+            {"type": "TextBlock", "text": "91%", "tooltip": "剩余电量：91%，正在充电"}
+        ]
+    })";
+    reading = {};
+    assert(PhoneLink::Parse(zhCharging, reading));
+    assert(reading.name == L"V2366GA");
+    assert(reading.percent == 91);
+    assert(reading.charging);
+
+    const std::wstring zhLivePhoneLink = LR"({
+        "speak": "V2366GA - 已连接到你的电脑",
+        "body": [
+            {"type": "TextBlock", "text": "61%", "tooltip": "电池电量剩余 61%，正在充电"}
+        ]
+    })";
+    reading = {};
+    assert(PhoneLink::Parse(zhLivePhoneLink, reading));
+    assert(reading.name == L"V2366GA");
+    assert(reading.percent == 61);
+    assert(reading.charging);
+
+    const std::wstring zhDisconnected = LR"({
+        "speak": "V2366GA - 已从电脑断开连接。打开手机连接以使功能正常运行",
+        "body": [
+            {"type": "TextBlock", "tooltip": "电池电量: 83%"}
+        ]
+    })";
+    reading = {};
+    assert(!PhoneLink::Parse(zhDisconnected, reading));
+
     std::puts("Phone Link structural and localization tests passed");
     return 0;
 }

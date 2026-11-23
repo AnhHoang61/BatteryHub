@@ -5,12 +5,78 @@
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
+#include <cwctype>
 
 #include "drivers/drivers.h"
-#include "report.h"
 #include "hid.h"
 
 namespace {
+
+// 为什么这么做：设备在插线充电（USB 有线 / 2.4G / 蓝牙并存）时常以不同驱动条目和连接后缀同时上报；
+// 剥离连接方式噪点词后提取归一化基础名称，用于跨驱动去重与清除旧通道残影
+std::wstring NormalizeDeviceBaseName(const std::wstring& name) {
+    static const wchar_t* kNoise[] = {
+        L"wired", L"wireless", L"dongle", L"receiver", L"hyperspeed", L"hyperpolling", L"omni", L"speednova",
+        L"lightspeed", L"slipstream", L"8khz", L"8000hz", L"4k", L"4000hz", L"2.4g", L"2.4ghz", L"ghz",
+        L"bluetooth", L"bt", L"ble", L"usb", L"cable", L"adapter",
+        L"有线", L"无线", L"接收器", L"适配器", L"蓝牙",
+    };
+    auto isNoise = [&](const std::wstring& tok) {
+        for (const wchar_t* w : kNoise) if (tok == w) return true;
+        return false;
+    };
+    std::vector<std::wstring> tokens;
+    std::wstring cur;
+    for (wchar_t ch : name) {
+        ch = towlower(ch);
+        if (iswalnum(ch) || ch == L'.') {
+            cur.push_back(ch);
+        } else if (!cur.empty()) {
+            if (!isNoise(cur)) tokens.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty() && !isNoise(cur)) tokens.push_back(cur);
+    std::wstring joined;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (i) joined.push_back(L' ');
+        joined += tokens[i];
+    }
+    return joined;
+}
+
+int DevicePriority(const DeviceStatus& s) {
+    return (s.connected ? 8 : 0) + (!s.asleep ? 4 : 0) + (s.charging ? 2 : 0) + (s.percent >= 0 ? 1 : 0);
+}
+
+void DeduplicateByDevice(std::vector<DeviceStatus>& out) {
+    std::vector<DeviceStatus> merged;
+    merged.reserve(out.size());
+    for (auto& s : out) {
+        bool combined = false;
+        for (auto& m : merged) {
+            if (SamePhysicalDevice(m, s)) {
+                if (DevicePriority(s) > DevicePriority(m)) {
+                    bool chg = m.charging || s.charging;
+                    std::wstring detail = !s.detail.empty() ? s.detail : m.detail;
+                    int pct = s.percent >= 0 ? s.percent : m.percent;
+                    m = s;
+                    m.charging = chg;
+                    m.detail = detail;
+                    m.percent = pct;
+                } else {
+                    m.charging |= s.charging;
+                    if (m.percent < 0 && s.percent >= 0) m.percent = s.percent;
+                    if (m.detail.empty() && !s.detail.empty()) m.detail = s.detail;
+                }
+                combined = true;
+                break;
+            }
+        }
+        if (!combined) merged.push_back(std::move(s));
+    }
+    out = std::move(merged);
+}
 
 // HKCU\Software\WirelessBattery\IgnoreDevices (REG_SZ): "VID:PID" pairs in hex, separated by spaces,
 // commas or semicolons (e.g. "28BD:0947, 046D:C547"). No driver ever opens those devices (issue #232).
@@ -144,7 +210,15 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollBluetooth(ctx);   // before the generic HID check: Windows' own level wins for the same device
     PollGenericHid(ctx);
     PollXInput(ctx);
+    DeduplicateByDevice(ctx.out);
     return ctx.out;
+}
+
+bool SamePhysicalDevice(const DeviceStatus& a, const DeviceStatus& b) {
+    if (a.kind != b.kind) return false;
+    std::wstring na = NormalizeDeviceBaseName(a.name);
+    if (na.empty()) return false;
+    return na == NormalizeDeviceBaseName(b.name);
 }
 
 std::wstring DumpHidCollections() {
@@ -155,7 +229,7 @@ std::wstring DumpHidCollections() {
                  c.featLen());
         out += line + HidProduct(c) + L"\n";
     }
-    out += report::DumpExtras();  // unopenable HID collections, non-HID USB devices, Bluetooth devices
+    // 为什么这么做：已精简离线反馈模块 report，不再追加 report::DumpExtras() 的诊断片段
     out += DumpXentaFrames();
     out += DumpAstroFrames();
     return out;
