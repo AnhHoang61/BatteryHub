@@ -1,8 +1,10 @@
 build/
+dist/
 wireless-battery
 *.exe
 *.o
-dist/
+*.zip
+list.txt
 third_party/
 .claude/
 CLAUDE.md
