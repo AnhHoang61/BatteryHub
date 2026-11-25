@@ -113,6 +113,7 @@ std::vector<DeviceStatus> PollAllDevices() {
                         }),
                         ctx.colls.end());
     PollSinowealthReceiver(ctx);
+    PollLeobogCable(ctx);  // before Glorious, which probes every unclaimed 258A product
     PollGlorious(ctx);
     PollAula(ctx);       // before Kysona (shares the 3554 vendor id) and SONiX (shares 05AC:024F)
     PollAulaMouse(ctx);

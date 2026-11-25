@@ -208,7 +208,7 @@ bool ShouldDim(const DeviceStatus& s) {
     if (!s.connected) return true;
     // A sleeping device has no fresh reading: keep the last one, optionally at full brightness.
     if (s.asleep && !g_dimSleeping) return false;
-    return s.percent < 0;
+    return s.percent < 0 && s.levelText.empty();  // a level text alone (e.g. "USB") is a live status
 }
 
 bool LoadBoolSetting(const wchar_t* name, bool defaultVal) {
@@ -769,6 +769,7 @@ std::wstring StatusText(const TrayEntry& e) {
     std::wstring t;
     if (!s.levelText.empty() && s.percent >= 0) t = T(s.levelText);
     else if (s.percent >= 0) t = std::to_wstring(s.percent) + L"%";
+    else if (!s.levelText.empty()) t = T(s.levelText);
     else if (e.lastPct >= 0) t = TF(L"{percent}% (last known)", { { L"percent", std::to_wstring(e.lastPct) } });
     else t = T(L"unknown");
     if (!s.detail.empty() && s.percent >= 0) t += L" (" + s.detail + L")";
@@ -968,7 +969,7 @@ void UpdateWidget() {
         bool offline = !e->st.connected;
         it.percent = offline ? -1 : (e->st.percent >= 0 ? e->st.percent : e->lastPct);
         if (offline) it.text = L"\u00D7";  // clear status, not a stale percentage
-        else if (e->st.percent >= 0) it.text = T(e->st.levelText);
+        else if (e->st.percent >= 0 || !e->st.levelText.empty()) it.text = T(e->st.levelText);
         it.charging = !offline && !e->st.asleep && e->st.charging;
         it.full = !offline && (e->st.full || (e->st.charging && it.percent >= 100));
         it.dim = ShouldDim(e->st);
